@@ -5966,6 +5966,7 @@ public:
           /*.emit_herd_lock = */ clEmitHerdLock,
           /*.generate_shim_dma = */ clGenerateShimDMA,
           /*.insert_trace_packet_flow = */ clInsertTracePacketFlow,
+          /*.use_packet_flow_at_shim_dmas = */ false,
           /*.use_lock_race_condition_fix = */ clUseLockRaceConditionFix,
           /*.device = */ *device};
 
@@ -6078,6 +6079,7 @@ public:
         /* .emit_herd_lock = */ clEmitHerdLock,
         /* .generate_shim_dma = */ clGenerateShimDMA,
         /* .insert_trace_packet_flow = */ clInsertTracePacketFlow,
+        /* .use_packet_flow_at_shim_dmas = */ false,
         /* .use_lock_race_condition_fix = */ clUseLockRaceConditionFix,
         /* .device = */ *device};
     createAIEModulesAndOutlineCores(module, aie_devices, tileToHerdMap,
@@ -6594,6 +6596,7 @@ FailureOr<ModuleOp> convertAIRToAIE(mlir::RewriterBase &rewriter,
       /* .emit_herd_lock = */ false,
       /* .generate_shim_dma = */ false,
       /* .insert_trace_packet_flow = */ false,
+      /* .use_packet_flow_at_shim_dmas = */ false,
       /* .use_lock_race_condition_fix = */ true,
       /* .device = */ *device};
   std::vector<std::pair<ModuleOp, air::HerdOp>> aie_modules;
