@@ -232,16 +232,25 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
   // After air-collapse-herd, a 2D herd (e.g. 4x4) becomes 1D (16x1), but the
   // physical device may have fewer columns (e.g. 4 for npu2_4col). We wrap
   // the linear herd index back into a 2D physical layout.
+  //
+  // However, wrapping must NOT be applied when segment unrolling is active.
+  // With segment unrolling, each sub-device gets the full herd outlined and
+  // specialization patterns (SpecializeAffineIf/ScfIf) eliminate tiles that
+  // don't belong to this partition. Wrapping would map all tiles to valid
+  // positions, preventing specialization from eliminating any.
   auto &targetModel = aie_device.getTargetModel();
   int64_t num_device_cols = targetModel.columns();
+  bool hasSegmentUnroll = aie_device->hasAttr("segment_unroll_x");
 
   for (auto y = 0; y < herd_size_y; y++) {
     for (auto x = 0; x < herd_size_x; x++) {
       auto hloc = h.getLoc();
       IRMapping remap;
       int64_t phys_x, phys_y;
-      if (herd_size_y == 1 && herd_size_x > num_device_cols) {
-        // Collapsed herd exceeds device columns: wrap into 2D layout
+      if (!hasSegmentUnroll && herd_size_y == 1 &&
+          herd_size_x > num_device_cols) {
+        // Collapsed herd exceeds device columns: wrap into 2D layout.
+        // Only for non-unrolled devices (e.g. Pass B npu2_4col).
         phys_x = (x % num_device_cols) + col_offset;
         phys_y = (x / num_device_cols) + row_offset;
       } else {
