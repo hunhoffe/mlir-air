@@ -38,7 +38,6 @@ void xilinx::air::registerConversionPasses() {
   air_conv_passes::registerCopyToDma();
   air_conv_passes::registerAIRToAsync();
   air_conv_passes::registerInsertEmptyLaunchOverHerd();
-  air_conv_passes::registerAIRRankToLaunch();
   air_conv_passes::registerAIRWrapFuncWithParallelPass();
 #endif
 #if AIR_ENABLE_GPU

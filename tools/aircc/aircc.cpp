@@ -976,8 +976,7 @@ static LogicalResult runAieCompilation() {
   {
     raw_string_ostream os(placementPipeline);
     os << "builtin.module(";
-    os << "air-rank-to-launch";
-    os << ",air-insert-launch-around-herd{insert-segment=true}";
+    os << "air-insert-launch-around-herd{insert-segment=true}";
     os << ",func.func(air-lower-herd-parallel)";
     os << ",scf-forall-to-parallel";
 
