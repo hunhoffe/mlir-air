@@ -217,6 +217,7 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
   auto col_name = air::HerdOp::getColOffsetAttrName();
   auto row_name = air::HerdOp::getRowOffsetAttrName();
   auto ctx = h->getContext();
+  bool hasExplicitPlacement = h.getColOffset().has_value();
   if (auto co = h.getColOffset())
     col_offset = *co;
   else
@@ -233,11 +234,12 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
   // physical device may have fewer columns (e.g. 4 for npu2_4col). We wrap
   // the linear herd index back into a 2D physical layout.
   //
-  // However, wrapping must NOT be applied when segment unrolling is active.
-  // With segment unrolling, each sub-device gets the full herd outlined and
-  // specialization patterns (SpecializeAffineIf/ScfIf) eliminate tiles that
-  // don't belong to this partition. Wrapping would map all tiles to valid
-  // positions, preventing specialization from eliminating any.
+  // Wrapping must NOT be applied when:
+  // 1. Segment unrolling is active — each sub-device gets the full herd
+  //    outlined and specialization eliminates non-matching tiles.
+  // 2. The herd already has explicit placement (col/row offsets set by
+  //    air-place-herds) — wrapping would override the correct placement
+  //    and misroute data to wrong tiles, causing NaN outputs.
   auto &targetModel = aie_device.getTargetModel();
   int64_t num_device_cols = targetModel.columns();
   bool hasSegmentUnroll = aie_device->hasAttr("segment_unroll_x");
@@ -247,10 +249,10 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
       auto hloc = h.getLoc();
       IRMapping remap;
       int64_t phys_x, phys_y;
-      if (!hasSegmentUnroll && herd_size_y == 1 &&
+      if (!hasSegmentUnroll && !hasExplicitPlacement && herd_size_y == 1 &&
           herd_size_x > num_device_cols) {
         // Collapsed herd exceeds device columns: wrap into 2D layout.
-        // Only for non-unrolled devices (e.g. Pass B npu2_4col).
+        // Only when no prior placement pass has set offsets.
         phys_x = (x % num_device_cols) + col_offset;
         phys_y = (x / num_device_cols) + row_offset;
       } else {
