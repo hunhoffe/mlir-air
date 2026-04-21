@@ -17,10 +17,19 @@
 #include "air/Conversion/ConvertToAIRPass.h"
 
 #if AIR_ENABLE_AIE
-// Conduit dialect passes (Pass B: air.channel.* → Conduit IR).
-// Implemented in mlir-aie; wired here so air-opt can invoke them.
+// Conduit dialect passes (not Pass B — those are now local).
+// Other Conduit passes still live in mlir-aie.
 #include "aie/Dialect/Conduit/Transforms/ConduitPasses.h"
 #endif
+
+// Pass B factory functions (implemented locally in AirChannelToConduit.cpp
+// and AirChannelIndexFlattener.cpp).
+namespace xilinx::conduit {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createAirChannelToConduitPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createAirChannelIndexFlattenerPass();
+} // namespace xilinx::conduit
 
 namespace xilinx {
 namespace air {
