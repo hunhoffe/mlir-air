@@ -29,6 +29,8 @@
 #if AIR_ENABLE_AIE
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
+#include "aie/Dialect/Conduit/IR/ConduitDialect.h"
+#include "aie/Dialect/Conduit/Transforms/ConduitPasses.h"
 #endif
 
 #include "mlir/IR/Builders.h"
@@ -931,6 +933,9 @@ static LogicalResult runAieCompilation() {
   // --- Set up MLIR context and parse input ---
   mlir::registerAllPasses();
   xilinx::air::registerAllPasses();
+#if AIR_ENABLE_AIE
+  xilinx::conduit::registerConduitPasses();
+#endif
 
   DialectRegistry registry;
   registerAllDialects(registry);
@@ -938,6 +943,7 @@ static LogicalResult runAieCompilation() {
 #if AIR_ENABLE_AIE
   registry.insert<xilinx::AIE::AIEDialect>();
   registry.insert<xilinx::AIEX::AIEXDialect>();
+  registry.insert<xilinx::conduit::ConduitDialect>();
 #endif
   registerAllExtensions(registry);
 
@@ -1024,20 +1030,35 @@ static LogicalResult runAieCompilation() {
     return failure();
 
   // --- AIR to AIE conversion ---
+  // Conduit hierarchy split (default tail of aircc):
+  //   air-hierarchy-to-aie (steps 1-5 of legacy --air-to-aie; preserves
+  //                         air.channel for downstream Conduit lowering)
+  //   air-channel-to-conduit (Pass B: lift channel ops into Conduit IR)
+  //   conduit-fuse-channels  (DEFAULT-ON: merge adjacent producer/consumer
+  //                           channels; topology-changing transform)
+  //   conduit-depth-promote
+  //   air-merge-unrolled-devices
+  //
+  // NOTE: legacy --air-to-aie's `insert-trace-packet-flow` option is not
+  // accepted by --air-hierarchy-to-aie (channel-lowering related; dropped
+  // when channel lowering moved to Conduit). Trace-packet-flow insertion
+  // for tracing is currently NOT performed when traceSize > 0 along this
+  // path -- coordinate with team-lead if traced runs are required.
   std::string airToAiePipeline;
   {
     raw_string_ostream os(airToAiePipeline);
     os << "builtin.module(";
-    os << "air-to-aie{";
+    os << "air-hierarchy-to-aie{";
     os << "emit-while-loop=" << (omitWhileTrueLoop ? "false" : "true");
     os << " row-offset=" << resolvedRowOffset;
     os << " col-offset=" << resolvedColOffset;
     os << " device=" << deviceName.getValue();
-    if (traceSize > 0)
-      os << " insert-trace-packet-flow=true";
     os << " use-lock-race-condition-fix="
        << (useLockRaceConditionFix ? "true" : "false");
     os << "}";
+    os << ",air-channel-to-conduit";
+    os << ",conduit-fuse-channels";
+    os << ",conduit-depth-promote";
     os << ",air-merge-unrolled-devices";
     os << ")";
   }

@@ -32,7 +32,7 @@
 // CHECK-DAG: conduit.put_memref_async {{.*}}name = @data_in_1_1
 
 // No residual multi-dim channel or air ops.
-// CHECK-NOT: size = array<i64: 2, 2>
+// CHECK-NOT: air.channel @data_in [2, 2]
 // CHECK-NOT: air.channel
 
 module {
@@ -44,7 +44,7 @@ module {
     %tile_1_4 = aie.tile(1, 4)
 
     // 2x2 channel declaration (multi-dimensional)
-    "air.channel"() {sym_name = "data_in", size = array<i64: 2, 2>} : () -> ()
+    "air.channel"() {sym_name = "data_in", size = [2, 2]} : () -> ()
 
     // MemTile: distributes data to 4 tiles via @data_in[i,j]
     %l2_buf = aie.buffer(%tile_0_1) {sym_name = "l2_buf"} : memref<128xi32, 1>

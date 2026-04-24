@@ -199,14 +199,22 @@ struct AirChannelIndexFlattenerPass
       if (name.empty())
         return;
 
-      // Read the "size" attribute: array<i64: M, N>.
+      // Read the "size" attribute. The AIR.td schema declares it as
+      // I64ArrayAttr (printed `[M, N]`); accept the dense forms as well.
       auto sizeAttr = op->getAttr("size");
       if (!sizeAttr)
         return;
 
-      // Try DenseI64ArrayAttr (array<i64: ...>) or DenseIntElementsAttr.
       llvm::SmallVector<int64_t> shape;
-      if (auto dense = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(sizeAttr)) {
+      if (auto arr = mlir::dyn_cast<mlir::ArrayAttr>(sizeAttr)) {
+        for (auto v : arr) {
+          auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(v);
+          if (!intAttr)
+            return; // Non-integer entry — leave alone.
+          shape.push_back(intAttr.getInt());
+        }
+      } else if (auto dense =
+                     mlir::dyn_cast<mlir::DenseI64ArrayAttr>(sizeAttr)) {
         for (int64_t d : dense.asArrayRef())
           shape.push_back(d);
       } else if (auto intArr =
@@ -269,9 +277,10 @@ struct AirChannelIndexFlattenerPass
           attrs.push_back(
               mlir::NamedAttribute(mlir::StringAttr::get(ctx, "sym_name"),
                                    mlir::StringAttr::get(ctx, newName)));
-          attrs.push_back(
-              mlir::NamedAttribute(mlir::StringAttr::get(ctx, "size"),
-                                   mlir::DenseI64ArrayAttr::get(ctx, {1, 1})));
+          // Match the AIR.td schema: I64ArrayAttr (printed `[1, 1]`).
+          attrs.push_back(mlir::NamedAttribute(
+              mlir::StringAttr::get(ctx, "size"),
+              mlir::Builder(ctx).getI64ArrayAttr({1, 1})));
 
           mlir::OperationState state(loc, "air.channel");
           state.addAttributes(attrs);

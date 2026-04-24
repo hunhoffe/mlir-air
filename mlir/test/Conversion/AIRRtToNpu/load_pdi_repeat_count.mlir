@@ -346,7 +346,9 @@ module {
 // Test 7: No repeat_count, air.launch_end WaitAllOp without DMA operands
 // When output-elf=true, NpuDmaWaitOp should be emitted for all shim channels
 // to provide between-iteration synchronization (issue #1373).
-// When output-elf=false, no sync is needed.
+// When output-elf=false, generateMissingOutputAwaits() (added in d3795a1c)
+// also emits the await as a host-side correctness safety net so that the host
+// does not read the buffer before DMA completion.
 
 // EMIT-TRUE-LABEL: aie.device(npu2) @segment_no_repeat_no_dma_opers {
 // EMIT-TRUE: aie.runtime_sequence @segment_no_repeat_no_dma_opers_sequence
@@ -359,7 +361,7 @@ module {
 // EMIT-FALSE: aie.runtime_sequence
 // EMIT-FALSE:   aiex.dma_configure_task_for @airMemcpyId13 {
 // EMIT-FALSE:   aiex.dma_start_task
-// EMIT-FALSE-NOT:   aiex.dma_await_task
+// EMIT-FALSE:   aiex.dma_await_task
 // EMIT-FALSE-NOT:   aiex.npu.load_pdi
 
 module {

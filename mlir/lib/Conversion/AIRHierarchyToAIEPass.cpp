@@ -121,6 +121,50 @@ public:
           builder, deviceOp, module, /*clone_l2*/ true, /*clone_l3*/ true,
           device_options.use_lock_race_condition_fix, targetLaunch);
 
+      // Step 3b: rewire out-of-device async-token operands.
+      //
+      // cloneL2AndL3MemcpysToDeviceOp clones launch-level scf.for /
+      // air.channel.put / air.channel.get into the device, but air.wait_all
+      // is intentionally NOT cloned (see AIRToAIEPass.cpp's
+      // cloneL2AndL3MemcpysToDeviceOp walk: WaitAllOp is in the "advance"
+      // list, not the "clone" list).  As a result, a cloned scf.for's
+      // !air.async.token init_arg still references the original launch's
+      // air.wait_all.  When Step 4's lowerScfAirTokens then propagates that
+      // init_arg into channel.put async dependencies via replaceAllUsesWith,
+      // and Step 6 erases the launch (via dropAllDefinedValueUses), the
+      // cloned channel.put ends up with a NULL operand for its async dep.
+      //
+      // Fix: walk the device and replace any !air.async.token operand whose
+      // defining op (or block-arg parent op) lives outside this device with
+      // a fresh in-device air.wait_all (no deps, satisfied token).
+      {
+        auto *ctx = deviceOp->getContext();
+        deviceOp.walk([&](Operation *op) {
+          if (op == deviceOp.getOperation())
+            return;
+          for (OpOperand &operand : op->getOpOperands()) {
+            Value v = operand.get();
+            if (!v || !llvm::isa<air::AsyncTokenType>(v.getType()))
+              continue;
+            Operation *defOp = v.getDefiningOp();
+            bool inDevice = false;
+            if (defOp) {
+              inDevice = deviceOp->isAncestor(defOp);
+            } else if (auto blockArg = llvm::dyn_cast<BlockArgument>(v)) {
+              if (Operation *parentOp = blockArg.getOwner()->getParentOp())
+                inDevice = deviceOp->isAncestor(parentOp);
+            }
+            if (inDevice)
+              continue;
+            OpBuilder b(op);
+            auto fresh = air::WaitAllOp::create(
+                b, op->getLoc(), air::AsyncTokenType::get(ctx),
+                SmallVector<Value>{});
+            operand.set(fresh.getAsyncToken());
+          }
+        });
+      }
+
       // Step 4: lower AIR control-flow constructs.
       specializeHerdAffineIf(deviceOp);
       lowerAirExecute(deviceOp);
