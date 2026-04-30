@@ -332,11 +332,11 @@ tryGetEnclosingCoreTile(mlir::Operation *op) {
   return std::nullopt;
 }
 
-/// Find the MemTile in the given column by walking aie.tile ops inside the
-/// enclosing aie.device.  Returns a "tile(col,row)" string for the relay tile,
-/// or "" if no MemTile is found.
-static std::string findMemTileInColumn(mlir::Operation *contextOp,
-                                       int64_t col) {
+/// Find the MemTile (col, row) in the given column by walking aie.tile ops
+/// inside the enclosing aie.device.  Returns std::nullopt if no MemTile is
+/// found.
+static std::optional<std::pair<int64_t, int64_t>>
+findMemTileInColumn(mlir::Operation *contextOp, int64_t col) {
   // Walk up to find the enclosing aie.device.
   auto deviceOp = contextOp->getParentOfType<AIE::DeviceOp>();
   if (!deviceOp) {
@@ -350,24 +350,23 @@ static std::string findMemTileInColumn(mlir::Operation *contextOp,
     }
   }
   if (!deviceOp)
-    return "";
+    return std::nullopt;
 
   const AIE::AIETargetModel &tm = AIE::getTargetModel(deviceOp);
-  std::string result;
+  std::optional<std::pair<int64_t, int64_t>> result;
   // First, check instantiated TileOps in the column.
   deviceOp.walk([&](AIE::TileOp tileOp) {
-    if (result.empty() && (int64_t)tileOp.getCol() == col &&
+    if (!result && (int64_t)tileOp.getCol() == col &&
         tm.isMemTile(tileOp.getCol(), tileOp.getRow())) {
-      llvm::raw_string_ostream os(result);
-      os << "tile(" << tileOp.getCol() << "," << tileOp.getRow() << ")";
+      result = std::make_pair((int64_t)tileOp.getCol(),
+                              (int64_t)tileOp.getRow());
     }
   });
   // Fallback: consult the target model if no TileOp was instantiated.
-  if (result.empty()) {
+  if (!result) {
     for (int row = 0; row < tm.rows(); ++row) {
       if (tm.isMemTile(col, row)) {
-        llvm::raw_string_ostream os(result);
-        os << "tile(" << col << "," << row << ")";
+        result = std::make_pair(col, (int64_t)row);
         break;
       }
     }
@@ -846,19 +845,27 @@ struct AirChannelToConduitPass
                     mlir::FlatSymbolRefAttr::get(ctx, dstNames[idx]));
 
               // Determine relay MemTile from this column.
-              std::string memtileStr =
+              std::optional<std::pair<int64_t, int64_t>> memtileCoord =
                   findMemTileInColumn(createOp, col);
-              if (memtileStr.empty()) {
+              if (!memtileCoord) {
                 // Fallback: try producer tile column.
                 auto prodIt2 = channelProducerTile.find(name);
                 if (prodIt2 != channelProducerTile.end())
-                  memtileStr =
+                  memtileCoord =
                       findMemTileInColumn(createOp, prodIt2->second.first);
               }
+              if (!memtileCoord)
+                continue; // No MemTile available; skip emitting scatter.
+              auto deviceOp = createOp->getParentOfType<AIE::DeviceOp>();
+              if (!deviceOp)
+                continue;
+              // Builder overload uses TileOp::getOrCreate internally so the
+              // relay tile cannot be DCE'd after lowering (F1b invariant).
               builder.create<ScatterOp>(
                   loc, mlir::FlatSymbolRefAttr::get(ctx, name),
                   mlir::ArrayAttr::get(ctx, dstsAttrs),
-                  mlir::StringAttr::get(ctx, memtileStr),
+                  static_cast<int>(memtileCoord->first),
+                  static_cast<int>(memtileCoord->second),
                   /*offsets=*/mlir::DenseI64ArrayAttr{});
             }
           }

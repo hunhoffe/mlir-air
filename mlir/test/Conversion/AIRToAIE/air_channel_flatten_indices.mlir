@@ -16,13 +16,13 @@
 
 // Flat channel declarations emitted (four scalar channels).
 // MLIR prints attributes in alphabetical order: size before sym_name.
-// CHECK-DAG: "air.channel"() {size = array<i64: 1, 1>, sym_name = "matrix_0_0"
-// CHECK-DAG: "air.channel"() {size = array<i64: 1, 1>, sym_name = "matrix_0_1"
-// CHECK-DAG: "air.channel"() {size = array<i64: 1, 1>, sym_name = "matrix_1_0"
-// CHECK-DAG: "air.channel"() {size = array<i64: 1, 1>, sym_name = "matrix_1_1"
+// CHECK-DAG: "air.channel"() {size = [1, 1], sym_name = "matrix_0_0"
+// CHECK-DAG: "air.channel"() {size = [1, 1], sym_name = "matrix_0_1"
+// CHECK-DAG: "air.channel"() {size = [1, 1], sym_name = "matrix_1_0"
+// CHECK-DAG: "air.channel"() {size = [1, 1], sym_name = "matrix_1_1"
 
-// Original multi-dim channel is erased (no "size = array<i64: 2, 2>").
-// CHECK-NOT: size = array<i64: 2, 2>
+// Original multi-dim channel is erased (no "size = [2, 2]").
+// CHECK-NOT: size = [2, 2]
 
 // Rewritten channel names for put ops.
 // CHECK-DAG: chan_name = @matrix_0_0
@@ -34,7 +34,7 @@
 
 module {
   // Multi-dimensional 2×2 channel declaration.
-  "air.channel"() {sym_name = "matrix", size = array<i64: 2, 2>} : () -> ()
+  "air.channel"() {sym_name = "matrix", size = [2, 2]} : () -> ()
 
   func.func @test(%buf : memref<4xi32>) {
     %c0 = arith.constant 0 : index

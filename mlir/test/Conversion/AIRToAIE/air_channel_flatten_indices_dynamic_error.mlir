@@ -9,7 +9,7 @@
 // CHECK-SAME: matrix
 
 module {
-  "air.channel"() {sym_name = "matrix", size = array<i64: 2, 2>} : () -> ()
+  "air.channel"() {sym_name = "matrix", size = [2, 2]} : () -> ()
 
   func.func @test(%buf : memref<4xi32>, %i : index, %j : index) {
     // Dynamic indices (%i, %j are function arguments, not constants).

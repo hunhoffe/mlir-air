@@ -17,7 +17,7 @@
 // CHECK-SAME: matrix_rank2
 
 module {
-  "air.channel"() {sym_name = "matrix_rank2", size = array<i64: 2, 3>} : () -> ()
+  "air.channel"() {sym_name = "matrix_rank2", size = [2, 3]} : () -> ()
 
   func.func @test(%buf : memref<4xi32>, %dyn_i : index) {
     %c0 = arith.constant 0 : index

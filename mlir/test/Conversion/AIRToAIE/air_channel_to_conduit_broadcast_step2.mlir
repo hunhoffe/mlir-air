@@ -35,9 +35,9 @@
 // CHECK-SAME: element_type = memref<16xi32>
 // Per-column scatter ops (one per consumer column, each with column-local MemTile).
 // CHECK: conduit.scatter{src = @bcast, dsts = [@bcast_c0]
-// CHECK-SAME: memtile = "tile(2,1)"
+// CHECK-SAME: memtile = %mem_tile_2_1
 // CHECK: conduit.scatter{src = @bcast, dsts = [@bcast_c1]
-// CHECK-SAME: memtile = "tile(3,1)"
+// CHECK-SAME: memtile = %mem_tile_3_1
 
 // No residual air.channel declarations.
 // CHECK-NOT: air.channel {
