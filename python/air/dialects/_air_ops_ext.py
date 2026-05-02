@@ -130,32 +130,39 @@ class Herd(HerdOp):
         self.regions[0].blocks.append(*operand_types)
 
 
-class Rank(RankOp):
-    """Specialization for RankOp class."""
+try:
 
-    def __init__(
-        self,
-        name=None,
-        sizes=[],
-        async_token=None,
-        async_dependencies=[],
-        operands=[],
-        universe=None,
-        attributes={},
-        loc=None,
-        ip=None,
-    ):
-        sizes = list(map(pyint_to_index, sizes))
-        super().__init__(
-            async_token=async_token,
-            async_dependencies=async_dependencies,
-            universe=universe,
-            sizes=sizes,
-            rank_operands=operands,
-            sym_name=name,
-        )
-        operand_types = [s.type for s in sizes] * 2 + get_region_operand_types(operands)
-        self.regions[0].blocks.append(*operand_types)
+    class Rank(RankOp):
+        """Specialization for RankOp class."""
+
+        def __init__(
+            self,
+            name=None,
+            sizes=[],
+            async_token=None,
+            async_dependencies=[],
+            operands=[],
+            universe=None,
+            attributes={},
+            loc=None,
+            ip=None,
+        ):
+            sizes = list(map(pyint_to_index, sizes))
+            super().__init__(
+                async_token=async_token,
+                async_dependencies=async_dependencies,
+                universe=universe,
+                sizes=sizes,
+                rank_operands=operands,
+                sym_name=name,
+            )
+            operand_types = [s.type for s in sizes] * 2 + get_region_operand_types(
+                operands
+            )
+            self.regions[0].blocks.append(*operand_types)
+
+except NameError:
+    pass
 
 
 class Channel(ChannelOp):
@@ -166,6 +173,7 @@ class Channel(ChannelOp):
             Union[Sequence[Union[int, IntegerAttr, Operation, Value]], ArrayAttr]
         ] = None,
         size=None,
+        fusion_group: Optional[str] = None,
         loc=None,
         ip=None,
     ):
@@ -188,6 +196,9 @@ class Channel(ChannelOp):
                         static_sizes.append(ShapedType.get_dynamic_size())
                 broadcast_shape_attr = ArrayAttr.get(static_sizes)
             super().attributes["broadcast_shape"] = broadcast_shape_attr
+
+        if fusion_group is not None:
+            super().attributes["fusion_group"] = StringAttr.get(fusion_group)
 
 
 class ChannelGet(ChannelGetOp):
@@ -346,7 +357,10 @@ def module_builder(module_function):
 herd = region_op(Herd, terminator=lambda *_args: HerdTerminatorOp())
 launch = region_op(Launch, terminator=lambda *_args: LaunchTerminatorOp())
 segment = region_op(Segment, terminator=lambda *_args: SegmentTerminatorOp())
-rank = region_op(Rank, terminator=lambda *_args: RankTerminatorOp())
+try:
+    rank = region_op(Rank, terminator=lambda *_args: RankTerminatorOp())
+except NameError:
+    pass
 
 
 def external_func(name, inputs, outputs=None, visibility="private"):

@@ -11,6 +11,7 @@
 
 #if AIR_ENABLE_AIE
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
+#include "aie/Dialect/Conduit/Transforms/ConduitPasses.h"
 #endif
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -27,7 +28,6 @@ using namespace mlir;
 #define GEN_PASS_DEF_AIRTOASYNC
 #define GEN_PASS_DEF_COPYTODMA
 #define GEN_PASS_DEF_INSERTEMPTYLAUNCHOVERHERD
-#define GEN_PASS_DEF_AIRRANKTOLAUNCH
 #define GEN_PASS_DEF_PARALLELTOHERD
 #define GEN_PASS_DEF_PARALLELTOLAUNCH
 #define GEN_PASS_DEF_PARALLELTOSEGMENT
@@ -35,6 +35,7 @@ using namespace mlir;
 
 // AIE-specific pass definitions
 #if AIR_ENABLE_AIE
+#define GEN_PASS_DEF_AIRHIERARCHYTOAIE
 #define GEN_PASS_DEF_AIRLINALGTOFUNC
 #define GEN_PASS_DEF_AIRLOWERING
 #define GEN_PASS_DEF_AIRPIPELINETOAFFINE

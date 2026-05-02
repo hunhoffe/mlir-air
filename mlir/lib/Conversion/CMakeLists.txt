@@ -11,6 +11,9 @@ set(CONVERSION_SOURCES
 )
 if(AIR_ENABLE_AIE)
   list(APPEND CONVERSION_SOURCES
+    AirChannelToConduit.cpp
+    AirChannelIndexFlattener.cpp
+    AIRHierarchyToAIEPass.cpp
     AIRLoweringPass.cpp
     AIRRtToLLVMPass.cpp
     AIRToAIEPass.cpp
@@ -46,6 +49,7 @@ if(AIR_ENABLE_AIE)
   list(APPEND CONVERSION_LINK_LIBS
     AIE
     AIEX
+    ConduitTransforms
   )
 endif()
 

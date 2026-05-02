@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "air/Conversion/AIRToAIEPass.h"
 #include "air/Conversion/AIRToAIESchedulingUtils.h"
 #include "air/Dialect/AIR/AIRDialect.h"
 #include "air/Dialect/AIRRt/AIRRtDialect.h"
@@ -60,16 +61,8 @@ using namespace mlir;
 namespace xilinx {
 namespace air {
 
-struct AIRToAIEConversionOptions {
-  int64_t col_offset;
-  int64_t row_offset;
-  bool emit_while;
-  bool emit_herd_lock;
-  bool generate_shim_dma;
-  bool insert_trace_packet_flow;
-  bool use_lock_race_condition_fix;
-  AIE::AIEDevice device;
-};
+// AIRToAIEConversionOptions is defined in AIRToAIEPass.h (shared with
+// AIRHierarchyToAIEPass).
 
 // Breakpoint stages for debugging with --test-patterns
 // Each stage represents a point in the pipeline where execution can stop
@@ -224,6 +217,7 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
   auto col_name = air::HerdOp::getColOffsetAttrName();
   auto row_name = air::HerdOp::getRowOffsetAttrName();
   auto ctx = h->getContext();
+  bool hasExplicitPlacement = h.getColOffset().has_value();
   if (auto co = h.getColOffset())
     col_offset = *co;
   else
@@ -235,12 +229,36 @@ void outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
     h->setAttr(row_name,
                IntegerAttr::get(IntegerType::get(ctx, 32), row_offset));
 
+  // Get the number of columns in the device for wrapping collapsed herds.
+  // After air-collapse-herd, a 2D herd (e.g. 4x4) becomes 1D (16x1), but the
+  // physical device may have fewer columns (e.g. 4 for npu2_4col). We wrap
+  // the linear herd index back into a 2D physical layout.
+  //
+  // Wrapping must NOT be applied when:
+  // 1. Segment unrolling is active — each sub-device gets the full herd
+  //    outlined and specialization eliminates non-matching tiles.
+  // 2. The herd already has explicit placement (col/row offsets set by
+  //    air-place-herds) — wrapping would override the correct placement
+  //    and misroute data to wrong tiles, causing NaN outputs.
+  auto &targetModel = aie_device.getTargetModel();
+  int64_t num_device_cols = targetModel.columns();
+  bool hasSegmentUnroll = aie_device->hasAttr("segment_unroll_x");
+
   for (auto y = 0; y < herd_size_y; y++) {
     for (auto x = 0; x < herd_size_x; x++) {
       auto hloc = h.getLoc();
       IRMapping remap;
-      auto phys_x = x + col_offset;
-      auto phys_y = y + row_offset;
+      int64_t phys_x, phys_y;
+      if (!hasSegmentUnroll && !hasExplicitPlacement && herd_size_y == 1 &&
+          herd_size_x > num_device_cols) {
+        // Collapsed herd exceeds device columns: wrap into 2D layout.
+        // Only when no prior placement pass has set offsets.
+        phys_x = (x % num_device_cols) + col_offset;
+        phys_y = (x / num_device_cols) + row_offset;
+      } else {
+        phys_x = x + col_offset;
+        phys_y = y + row_offset;
+      }
 
       // make the aie.tile
       auto tile = air::getPhysTileOp(aie_device, phys_x, phys_y);
@@ -1999,169 +2017,6 @@ void L2MemrefToMemTileMap(
     memtile_id %= memtiles.size();
   }
 
-  // Third stage: column-affinity optimization via pairwise swaps.
-  //
-  // The round-robin above distributes DMA pressure evenly but ignores
-  // topology. When a bucket's channels all connect to cores in a single
-  // column, placing it on that column's memtile avoids cross-column routing.
-  // We improve locality by swapping pairs of buckets between memtiles when:
-  //   - at least one bucket moves closer to its affinity column, and
-  //   - neither bucket moves further from its affinity column, and
-  //   - both memtiles have enough capacity after the swap.
-  // Because swaps are count-neutral (each memtile keeps the same number of
-  // buckets), DMA channel/BD pressure remains balanced.
-
-  // Build column-to-memtile-index map.
-  DenseMap<int, int> colToMemtileIdx;
-  for (int i = 0; i < (int)memtiles.size(); i++) {
-    assert(!colToMemtileIdx.count(memtiles[i].getCol()) &&
-           "multiple memtiles in same column not supported by column-affinity "
-           "optimization");
-    colToMemtileIdx[memtiles[i].getCol()] = i;
-  }
-
-  // Cache channel → connected core columns.
-  DenseMap<air::ChannelOp, SmallVector<int>> channelToCoreCols;
-  auto getCoreCols = [&](air::ChannelOp channelOp) -> ArrayRef<int> {
-    auto it = channelToCoreCols.find(channelOp);
-    if (it != channelToCoreCols.end())
-      return it->second;
-    llvm::SmallSetVector<int, 8> cols;
-    for (auto put : air::getChannelPutOpThroughSymbol(channelOp, m))
-      if (auto core = put->getParentOfType<AIE::CoreOp>())
-        cols.insert(core.getTileOp().getCol());
-    for (auto get : air::getChannelGetOpThroughSymbol(channelOp, m))
-      if (auto core = get->getParentOfType<AIE::CoreOp>())
-        cols.insert(core.getTileOp().getCol());
-    auto &entry = channelToCoreCols[channelOp];
-    entry.assign(cols.begin(), cols.end());
-    return entry;
-  };
-
-  // Compute affinity column for each bucket (-1 = no single-column affinity).
-  SmallVector<int> bucketAffinityCol(memref_buckets.size(), -1);
-  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
-    llvm::SmallSetVector<int, 8> cols;
-    for (auto alloc : memref_buckets[bi]) {
-      for (auto user : alloc.getMemref().getUsers()) {
-        auto chanIf = dyn_cast<air::ChannelInterface>(user);
-        if (!chanIf)
-          continue;
-        auto channelOp = air::getChannelDeclarationThroughSymbol(chanIf);
-        if (!channelOp)
-          continue;
-        for (int c : getCoreCols(channelOp))
-          cols.insert(c);
-      }
-    }
-    if (cols.size() == 1)
-      bucketAffinityCol[bi] = cols.front();
-    LLVM_DEBUG(llvm::dbgs()
-               << "L2MemrefToMemTileMap: bucket " << bi << " has "
-               << memref_buckets[bi].size() << " alloc(s), affinity col = "
-               << bucketAffinityCol[bi] << "\n");
-  }
-
-  // Compute bucket sizes.
-  SmallVector<uint32_t> bucketSizes(memref_buckets.size(), 0);
-  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
-    for (auto alloc : memref_buckets[bi]) {
-      MemRefType ty = llvm::cast<MemRefType>(alloc.getMemref().getType());
-      bucketSizes[bi] +=
-          air::getElementSizeInBytes(ty) * air::getTensorVolume(ty);
-    }
-  }
-
-  // Record current memtile index for each bucket.
-  SmallVector<int> bucketMemtileIdx(memref_buckets.size());
-  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
-    auto alloc0 = memref_buckets[bi][0];
-    auto tile = memrefToMemTileMap[alloc0];
-    for (int mi = 0; mi < (int)memtiles.size(); mi++) {
-      if (memtiles[mi] == tile) {
-        bucketMemtileIdx[bi] = mi;
-        break;
-      }
-    }
-  }
-
-  // Helper: does bucket bi sit on its affinity column's memtile?
-  auto isOnAffinityMemtile = [&](int bi) -> bool {
-    if (bucketAffinityCol[bi] < 0)
-      return false;
-    auto it = colToMemtileIdx.find(bucketAffinityCol[bi]);
-    return it != colToMemtileIdx.end() && it->second == bucketMemtileIdx[bi];
-  };
-
-  // Try pairwise swaps. Iterate all bucket pairs (i, j) on different
-  // memtiles. A swap is beneficial if it strictly improves affinity for at
-  // least one bucket without hurting the other.
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (int i = 0; i < (int)memref_buckets.size(); i++) {
-      if (bucketAffinityCol[i] < 0)
-        continue; // no affinity preference
-      if (isOnAffinityMemtile(i))
-        continue; // already optimal
-      auto affinityIt = colToMemtileIdx.find(bucketAffinityCol[i]);
-      if (affinityIt == colToMemtileIdx.end())
-        continue;
-      int targetMtIdx = affinityIt->second;
-
-      for (int j = 0; j < (int)memref_buckets.size(); j++) {
-        if (i == j)
-          continue;
-        if (bucketMemtileIdx[j] != targetMtIdx)
-          continue; // j is not on i's target memtile
-
-        // Don't swap if j is already on its own affinity memtile.
-        if (isOnAffinityMemtile(j))
-          continue;
-
-        // Check capacity: can the memtiles accommodate the swap?
-        int mtI = bucketMemtileIdx[i];
-        int mtJ = bucketMemtileIdx[j]; // == targetMtIdx
-        int32_t deltaI = (int32_t)bucketSizes[j] - (int32_t)bucketSizes[i];
-        int32_t deltaJ = (int32_t)bucketSizes[i] - (int32_t)bucketSizes[j];
-        if ((int32_t)memtileToSizeMap[memtiles[mtI]] + deltaI < 0)
-          continue;
-        if ((int32_t)memtileToSizeMap[memtiles[mtJ]] + deltaJ < 0)
-          continue;
-
-        // Perform the swap.
-        LLVM_DEBUG(llvm::dbgs()
-                   << "L2MemrefToMemTileMap: swapping bucket " << i
-                   << " (affinity col " << bucketAffinityCol[i]
-                   << ", on memtile " << mtI << ") with bucket " << j
-                   << " (affinity col " << bucketAffinityCol[j]
-                   << ", on memtile " << mtJ << ")\n");
-        memtileToSizeMap[memtiles[mtI]] += deltaI;
-        memtileToSizeMap[memtiles[mtJ]] += deltaJ;
-        bucketMemtileIdx[i] = mtJ;
-        bucketMemtileIdx[j] = mtI;
-        for (auto alloc : memref_buckets[i])
-          memrefToMemTileMap[alloc] = memtiles[mtJ];
-        for (auto alloc : memref_buckets[j])
-          memrefToMemTileMap[alloc] = memtiles[mtI];
-        changed = true;
-        break; // restart inner loop for bucket i (it moved)
-      }
-      if (changed)
-        break; // restart outer loop
-    }
-  }
-  LLVM_DEBUG({
-    int swappedCount = 0;
-    for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
-      if (isOnAffinityMemtile(bi))
-        swappedCount++;
-    }
-    llvm::dbgs() << "L2MemrefToMemTileMap: column-affinity optimization "
-                    "placed "
-                 << swappedCount << " of " << memref_buckets.size()
-                 << " bucket(s) on their affinity memtile\n";
-  });
 }
 
 void allocL2Buffers(AIE::DeviceOp m,
@@ -2727,7 +2582,7 @@ void specializeChannelBundle(
 // An orphaned channel is one that has puts but no gets, or gets but no puts.
 // This happens when cloning L3 ops to all devices, but each device only
 // using a subset of them.
-static void removeOrphanedChannels(AIE::DeviceOp &d) {
+void removeOrphanedChannels(AIE::DeviceOp &d) {
   SmallVector<air::ChannelOp> channelsToRemove;
   SmallVector<Operation *> opsToRemove;
 
@@ -2956,6 +2811,273 @@ static void removeDeadGlobalOps(AIE::DeviceOp device) {
   for (auto op : deadGlobals)
     op->erase();
 }
+
+// ---------------------------------------------------------------------------
+// Free-function versions of hierarchy helpers, shared with
+// AIRHierarchyToAIEPass. Declared in AIRToAIEPass.h.
+// ---------------------------------------------------------------------------
+
+/// Balance the number of L2 memref puts/gets by inserting dummy channel ops.
+static void insertDummyChannelOpsForL2MemrefsFn(AIE::DeviceOp aieDevice,
+                                                OpBuilder &builder) {
+  llvm::DenseMap<Value, std::pair<llvm::SmallVector<air::ChannelPutOp>,
+                                  llvm::SmallVector<air::ChannelGetOp>>>
+      l2MemrefPutsGets;
+  llvm::SmallVector<Value> l2MemrefOrder;
+
+  aieDevice.walk<mlir::WalkOrder::PreOrder, ForwardDominanceIterator<>>(
+      [&](air::ChannelInterface chanI) {
+        auto memrefTy =
+            dyn_cast_if_present<BaseMemRefType>(chanI.getMemref().getType());
+        if (!memrefTy || !air::isL2(memrefTy))
+          return mlir::WalkResult::advance();
+
+        Value memref = chanI.getMemref();
+        if (!l2MemrefPutsGets.count(memref))
+          l2MemrefOrder.push_back(memref);
+
+        if (auto chanPut =
+                dyn_cast_if_present<air::ChannelPutOp>(chanI.getOperation()))
+          l2MemrefPutsGets[memref].first.push_back(chanPut);
+        else if (auto chanGet = dyn_cast_if_present<air::ChannelGetOp>(
+                     chanI.getOperation()))
+          l2MemrefPutsGets[memref].second.push_back(chanGet);
+
+        return mlir::WalkResult::advance();
+      });
+
+  for (Value memref : l2MemrefOrder) {
+    auto &putsAndGets = l2MemrefPutsGets[memref];
+    auto &[puts, gets] = putsAndGets;
+    if (puts.empty() || gets.empty())
+      continue;
+
+    unsigned numOpsToClone = 0;
+    Operation *templateOp = nullptr;
+
+    if (puts.size() < gets.size()) {
+      builder.setInsertionPoint(puts.front());
+      templateOp = puts.front();
+      numOpsToClone = gets.size() - puts.size();
+    } else if (gets.size() < puts.size()) {
+      builder.setInsertionPointAfter(gets.back());
+      templateOp = gets.back();
+      numOpsToClone = puts.size() - gets.size();
+    } else {
+      continue;
+    }
+
+    Value zeroIdx =
+        arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), 0);
+    Value oneIdx =
+        arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), 1);
+
+    auto templateAsyncIf =
+        dyn_cast_if_present<air::AsyncOpInterface>(templateOp);
+    auto templateChanIf =
+        dyn_cast_if_present<air::ChannelInterface>(templateOp);
+    assert(templateAsyncIf && templateChanIf &&
+           "Expected valid async/channel op");
+
+    for (unsigned i = 0; i < numOpsToClone; ++i) {
+      if (isa<air::ChannelPutOp>(templateOp)) {
+        air::ChannelPutOp::create(
+            builder, templateOp->getLoc(), templateOp->getResultTypes(),
+            templateAsyncIf.getAsyncDependencies(),
+            templateChanIf.getChanName(), templateChanIf.getIndices(),
+            templateChanIf.getMemref(),
+            /*sizes*/ SmallVector<Value>{zeroIdx},
+            /*offsets*/ SmallVector<Value>{zeroIdx},
+            /*steps*/ SmallVector<Value>{oneIdx},
+            /*pad_before=*/nullptr, /*pad_after=*/nullptr);
+      } else if (isa<air::ChannelGetOp>(templateOp)) {
+        air::ChannelGetOp::create(
+            builder, templateOp->getLoc(), templateOp->getResultTypes(),
+            templateAsyncIf.getAsyncDependencies(),
+            templateChanIf.getChanName(), templateChanIf.getIndices(),
+            templateChanIf.getMemref(),
+            /*sizes*/ SmallVector<Value>{zeroIdx},
+            /*offsets*/ SmallVector<Value>{zeroIdx},
+            /*steps*/ SmallVector<Value>{oneIdx},
+            /*pad_before=*/nullptr, /*pad_after=*/nullptr);
+      }
+    }
+  }
+}
+
+void cloneL2AndL3MemcpysToDeviceOp(OpBuilder &builder,
+                                   AIE::DeviceOp aie_device, ModuleOp module,
+                                   bool clone_l2, bool clone_l3,
+                                   bool lock_race_condition_fix,
+                                   air::LaunchOp targetLaunch) {
+  if (!clone_l2 && !clone_l3)
+    return;
+
+  auto ctx = builder.getContext();
+
+  Operation *t = nullptr;
+  for (auto tile_op : aie_device.getBody()->getOps<AIE::TileOp>()) {
+    t = tile_op.getOperation();
+  }
+  builder.setInsertionPointAfter(t);
+  IRMapping remap;
+
+  // Set up segment operand -> constant remapping.
+  // For unrolled segments (totalUnroll > 1), use the stored unroll indices.
+  // For non-unrolled segments (totalUnroll == 1), also remap segment IDs to
+  // constant 0 so that channel ops using segment indices as channel bundle
+  // positions get properly specialized (e.g., ChannelPut with indices=[seg_x]
+  // becomes indices=[0]).
+  {
+    int64_t unrollX = 0;
+    int64_t unrollY = 0;
+    if (auto unrollXAttr =
+            aie_device->getAttrOfType<IntegerAttr>("segment_unroll_x"))
+      unrollX = unrollXAttr.getInt();
+    if (auto unrollYAttr =
+            aie_device->getAttrOfType<IntegerAttr>("segment_unroll_y"))
+      unrollY = unrollYAttr.getInt();
+    for (auto func : module.getOps<func::FuncOp>()) {
+      func.walk([&](air::SegmentOp segOp) {
+        auto segIds = segOp.getIds();
+        if (segIds.size() >= 1) {
+          remap.map(segIds[0],
+                    arith::ConstantIndexOp::create(
+                        builder, builder.getUnknownLoc(), unrollX));
+        }
+        if (segIds.size() >= 2) {
+          remap.map(segIds[1],
+                    arith::ConstantIndexOp::create(
+                        builder, builder.getUnknownLoc(), unrollY));
+        }
+      });
+    }
+  }
+
+  // Map index-typed segment kernel arguments to constant 0.  When a
+  // segment receives launch iteration indices as kernel arguments (e.g.,
+  // for computing L3 subview offsets), those SSA values live outside the
+  // aie.device's isolated-from-above region.  At the device level the
+  // actual offsets are handled by the shimDMA / NPU instruction sequence,
+  // so zero is the correct placeholder.
+  for (auto func : module.getOps<func::FuncOp>()) {
+    func.walk([&](air::SegmentOp segOp) {
+      for (unsigned i = 0, e = segOp.getNumKernelOperands(); i < e; i++) {
+        Value karg = segOp.getKernelArgument(i);
+        if (!isa<IndexType>(karg.getType()))
+          continue;
+        if (remap.contains(karg))
+          continue;
+        remap.map(karg, arith::ConstantIndexOp::create(
+                            builder, builder.getUnknownLoc(), 0));
+      }
+    });
+  }
+
+  // Pre-create AIE::ExternalBufferOp for any L3 memrefs.
+  llvm::DenseSet<Value> l3MemrefsHandled;
+  for (auto func : module.getOps<func::FuncOp>()) {
+    func.walk([&](Operation *op) {
+      if (isa<air::LaunchOp, func::FuncOp, air::HerdOp>(op))
+        return WalkResult::advance();
+      if (isa<air::LaunchTerminatorOp, air::SegmentTerminatorOp,
+              func::ReturnOp, air::WaitAllOp>(op))
+        return WalkResult::advance();
+      if (targetLaunch) {
+        auto parentLaunch = op->getParentOfType<air::LaunchOp>();
+        if (!parentLaunch || parentLaunch != targetLaunch)
+          return WalkResult::advance();
+      }
+      for (auto operand : op->getOperands()) {
+        auto memrefTy = dyn_cast_if_present<MemRefType>(operand.getType());
+        if (!memrefTy)
+          continue;
+        if (!air::isL3(memrefTy))
+          continue;
+        if (l3MemrefsHandled.contains(operand))
+          continue;
+        l3MemrefsHandled.insert(operand);
+        std::string sym_name = createSymbolName(aie_device.getOperation(),
+                                                "__air_external_buffer");
+        auto extBuf = AIE::ExternalBufferOp::create(
+            builder, builder.getUnknownLoc(), memrefTy,
+            builder.getStringAttr(sym_name), /*address=*/nullptr);
+        remap.map(operand, extBuf.getResult());
+      }
+      return WalkResult::advance();
+    });
+  }
+
+  SmallVector<func::FuncOp> funcs;
+  module.walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
+      [&](func::FuncOp f) {
+        funcs.push_back(f);
+        return WalkResult::advance();
+      });
+  for (auto f : funcs) {
+    f.walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
+        [&](Operation *op) {
+          if (isa<air::LaunchOp, func::FuncOp>(op))
+            return WalkResult::advance();
+          if (isa<air::SegmentOp>(op) && clone_l2)
+            return WalkResult::advance();
+          if (isa<air::HerdOp>(op))
+            return WalkResult::skip();
+          if (isa<air::LaunchTerminatorOp, air::SegmentTerminatorOp,
+                  func::ReturnOp, air::WaitAllOp>(op))
+            return WalkResult::advance();
+          bool hasParentSegmentOp = op->getParentOfType<air::SegmentOp>();
+          if (!clone_l3 && !hasParentSegmentOp)
+            return WalkResult::advance();
+          if (targetLaunch) {
+            auto parentLaunch = op->getParentOfType<air::LaunchOp>();
+            if (!parentLaunch || parentLaunch != targetLaunch)
+              return WalkResult::advance();
+          }
+          builder.clone(*op, remap);
+          return WalkResult::skip();
+        });
+  }
+
+  // Remove ops which are irrelevant to L2 and L3 data movements.
+  aie_device.walk([ctx](air::HierarchyInterface hierOp) {
+    OpBuilder b(hierOp);
+    for (auto r : hierOp->getResults()) {
+      if (isa<air::AsyncTokenType>(r.getType())) {
+        r.replaceAllUsesWith(
+            air::WaitAllOp::create(b, hierOp->getLoc(),
+                                   air::AsyncTokenType::get(ctx),
+                                   air::getAsyncDependenciesFromOp(hierOp))
+                .getAsyncToken());
+      }
+    }
+    hierOp->erase();
+  });
+
+  // Unroll scf.parallel
+  RewritePatternSet patterns(ctx);
+  air::populateAIRunrollAIRChannelPutGetInScfParallelPatterns(patterns);
+  (void)applyPatternsGreedily(aie_device, std::move(patterns));
+
+  // Substituting index operands to constant zero for convenience.
+  aie_device.walk([](air::ChannelInterface chanI) {
+    OpBuilder b(chanI);
+    for (auto oper : llvm::concat<Value>(chanI.getOffsets(), chanI.getSizes(),
+                                         chanI.getStrides())) {
+      if (!getConstantIntValue(oper)) {
+        chanI->replaceUsesOfWith(
+            oper, arith::ConstantIndexOp::create(b, b.getUnknownLoc(), 0));
+      }
+    }
+  });
+
+  // Balance L2 buffer puts/gets for race condition fix.
+  if (lock_race_condition_fix) {
+    insertDummyChannelOpsForL2MemrefsFn(aie_device, builder);
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 class AIRToAIEPass : public air::impl::AIRToAIEBase<AIRToAIEPass> {
 
@@ -3399,308 +3521,7 @@ public:
       getAIRMemcpyOpInBlock<T>(b, output);
   }
 
-  /// Insert dummy air.channel.put or air.channel.get operations for L2 memrefs
-  /// to ensure that the number of puts and gets match for each buffer.
-  /// This helps prevent the risk if a race condition due to imbalanced lock
-  /// allocated on both sides.
-  ///
-  /// For memrefs in L2 memory space:
-  ///   - If there are more gets than puts: clone and insert dummy puts before
-  ///   the first put
-  ///   - If there are more puts than gets: clone and insert dummy gets after
-  ///   the last get
-  ///
-  /// \param aieDevice The surrounding aie.device operation to walk.
-  /// \param builder An OpBuilder to insert new operations.
-  ///
-  void insertDummyChannelOpsForL2Memrefs(AIE::DeviceOp aieDevice,
-                                         OpBuilder &builder) {
-    // Map from L2 memref -> (list of puts, list of gets).
-    // Use DenseMap for fast lookup, but track walk-order in a separate vector
-    // to ensure deterministic iteration (DenseMap iterates in pointer-hash
-    // order which varies with binary layout).
-    llvm::DenseMap<Value, std::pair<llvm::SmallVector<air::ChannelPutOp>,
-                                    llvm::SmallVector<air::ChannelGetOp>>>
-        l2MemrefPutsGets;
-    llvm::SmallVector<Value> l2MemrefOrder;
-
-    // Walk all ChannelInterface ops under the device and categorize puts/gets
-    // on L2 memrefs
-    aieDevice.walk<mlir::WalkOrder::PreOrder, ForwardDominanceIterator<>>(
-        [&](air::ChannelInterface chanI) {
-          auto memrefTy =
-              dyn_cast_if_present<BaseMemRefType>(chanI.getMemref().getType());
-          if (!memrefTy || !air::isL2(memrefTy))
-            return mlir::WalkResult::advance();
-
-          Value memref = chanI.getMemref();
-          if (!l2MemrefPutsGets.count(memref))
-            l2MemrefOrder.push_back(memref);
-
-          if (auto chanPut =
-                  dyn_cast_if_present<air::ChannelPutOp>(chanI.getOperation()))
-            l2MemrefPutsGets[memref].first.push_back(chanPut);
-          else if (auto chanGet = dyn_cast_if_present<air::ChannelGetOp>(
-                       chanI.getOperation()))
-            l2MemrefPutsGets[memref].second.push_back(chanGet);
-
-          return mlir::WalkResult::advance();
-        });
-
-    // Balance puts and gets by inserting dummy ops (iterate in walk order
-    // for deterministic output regardless of binary layout)
-    for (Value memref : l2MemrefOrder) {
-      auto &putsAndGets = l2MemrefPutsGets[memref];
-      auto &[puts, gets] = putsAndGets;
-      if (puts.empty() || gets.empty())
-        continue; // Skip buffers that only appear in one direction
-
-      unsigned numOpsToClone = 0;
-      Operation *templateOp = nullptr;
-
-      // Determine imbalance pattern and insertion point
-      if (puts.size() < gets.size()) {
-        // "Join" pattern — add dummy puts
-        builder.setInsertionPoint(puts.front());
-        templateOp = puts.front();
-        numOpsToClone = gets.size() - puts.size();
-      } else if (gets.size() < puts.size()) {
-        // "Distribute" pattern — add dummy gets
-        builder.setInsertionPointAfter(gets.back());
-        templateOp = gets.back();
-        numOpsToClone = puts.size() - gets.size();
-      } else {
-        continue; // Already balanced
-      }
-
-      // Constants for dummy sizes: zero offset, one element
-      Value zeroIdx =
-          arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), 0);
-      Value oneIdx =
-          arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), 1);
-
-      // Use the original op as a template to emit new dummy ops
-      auto templateAsyncIf =
-          dyn_cast_if_present<air::AsyncOpInterface>(templateOp);
-      auto templateChanIf =
-          dyn_cast_if_present<air::ChannelInterface>(templateOp);
-      assert(templateAsyncIf && templateChanIf &&
-             "Expected valid async/channel op");
-
-      for (unsigned i = 0; i < numOpsToClone; ++i) {
-        if (isa<air::ChannelPutOp>(templateOp)) {
-          air::ChannelPutOp::create(
-              builder, templateOp->getLoc(), templateOp->getResultTypes(),
-              templateAsyncIf.getAsyncDependencies(),
-              templateChanIf.getChanName(), templateChanIf.getIndices(),
-              templateChanIf.getMemref(),
-              /*sizes*/ SmallVector<Value>{zeroIdx},
-              /*offsets*/ SmallVector<Value>{zeroIdx},
-              /*steps*/ SmallVector<Value>{oneIdx},
-              /*pad_before=*/nullptr, /*pad_after=*/nullptr);
-        } else if (isa<air::ChannelGetOp>(templateOp)) {
-          air::ChannelGetOp::create(
-              builder, templateOp->getLoc(), templateOp->getResultTypes(),
-              templateAsyncIf.getAsyncDependencies(),
-              templateChanIf.getChanName(), templateChanIf.getIndices(),
-              templateChanIf.getMemref(),
-              /*sizes*/ SmallVector<Value>{zeroIdx},
-              /*offsets*/ SmallVector<Value>{zeroIdx},
-              /*steps*/ SmallVector<Value>{oneIdx},
-              /*pad_before=*/nullptr, /*pad_after=*/nullptr);
-        }
-      }
-    }
-  }
-
-  // Clone data movement ops to and from memtile and shim tile DMAs
-  // If targetLaunch is provided, only clone ops from that specific launch.
-  void cloneL2AndL3MemcpysToDeviceOp(OpBuilder &builder,
-                                     AIE::DeviceOp aie_device, ModuleOp module,
-                                     bool clone_l2, bool clone_l3,
-                                     bool lock_race_condition_fix = true,
-                                     air::LaunchOp targetLaunch = nullptr) {
-
-    if (!clone_l2 && !clone_l3)
-      return;
-
-    auto ctx = builder.getContext();
-
-    Operation *t = nullptr;
-    for (auto tile_op : aie_device.getBody()->getOps<AIE::TileOp>()) {
-      t = tile_op.getOperation();
-    }
-    builder.setInsertionPointAfter(t);
-    IRMapping remap;
-
-    // Set up segment operand -> constant remapping.
-    // For unrolled segments (totalUnroll > 1), use the stored unroll indices.
-    // For non-unrolled segments (totalUnroll == 1), also remap segment IDs to
-    // constant 0 so that channel ops using segment indices as channel bundle
-    // positions get properly specialized (e.g., ChannelPut with indices=[seg_x]
-    // becomes indices=[0]).
-    {
-      int64_t unrollX = 0;
-      int64_t unrollY = 0;
-      if (auto unrollXAttr =
-              aie_device->getAttrOfType<IntegerAttr>("segment_unroll_x"))
-        unrollX = unrollXAttr.getInt();
-      if (auto unrollYAttr =
-              aie_device->getAttrOfType<IntegerAttr>("segment_unroll_y"))
-        unrollY = unrollYAttr.getInt();
-      for (auto func : module.getOps<func::FuncOp>()) {
-        func.walk([&](air::SegmentOp segOp) {
-          auto segIds = segOp.getIds();
-          if (segIds.size() >= 1) {
-            remap.map(segIds[0],
-                      arith::ConstantIndexOp::create(
-                          builder, builder.getUnknownLoc(), unrollX));
-          }
-          if (segIds.size() >= 2) {
-            remap.map(segIds[1],
-                      arith::ConstantIndexOp::create(
-                          builder, builder.getUnknownLoc(), unrollY));
-          }
-        });
-      }
-    }
-
-    // Map index-typed segment kernel arguments to constant 0.  When a
-    // segment receives launch iteration indices as kernel arguments (e.g.,
-    // for computing L3 subview offsets), those SSA values live outside the
-    // aie.device's isolated-from-above region.  At the device level the
-    // actual offsets are handled by the shimDMA / NPU instruction sequence,
-    // so zero is the correct placeholder.
-    for (auto func : module.getOps<func::FuncOp>()) {
-      func.walk([&](air::SegmentOp segOp) {
-        for (unsigned i = 0, e = segOp.getNumKernelOperands(); i < e; i++) {
-          Value karg = segOp.getKernelArgument(i);
-          if (!isa<IndexType>(karg.getType()))
-            continue;
-          if (remap.contains(karg))
-            continue;
-          remap.map(karg, arith::ConstantIndexOp::create(
-                              builder, builder.getUnknownLoc(), 0));
-        }
-      });
-    }
-
-    // Pre-create AIE::ExternalBufferOp for any L3 memrefs that will be used
-    // by cloned ops. This is necessary because aie.device is an isolated-from-
-    // above region and cannot reference values defined outside it.
-    llvm::DenseSet<Value> l3MemrefsHandled;
-    for (auto func : module.getOps<func::FuncOp>()) {
-      func.walk([&](Operation *op) {
-        // Skip ops that won't be cloned
-        if (isa<air::LaunchOp, func::FuncOp, air::HerdOp>(op))
-          return WalkResult::advance();
-        if (isa<air::LaunchTerminatorOp, air::SegmentTerminatorOp,
-                func::ReturnOp, air::WaitAllOp>(op))
-          return WalkResult::advance();
-        // Filter by target launch
-        if (targetLaunch) {
-          auto parentLaunch = op->getParentOfType<air::LaunchOp>();
-          if (!parentLaunch || parentLaunch != targetLaunch)
-            return WalkResult::advance();
-        }
-        // Check for L3 memref operands
-        for (auto operand : op->getOperands()) {
-          auto memrefTy = dyn_cast_if_present<MemRefType>(operand.getType());
-          if (!memrefTy)
-            continue;
-          if (!air::isL3(memrefTy))
-            continue;
-          // Skip if already handled
-          if (l3MemrefsHandled.contains(operand))
-            continue;
-          l3MemrefsHandled.insert(operand);
-
-          // Create AIE::ExternalBufferOp for this L3 memref
-          std::string sym_name = createSymbolName(aie_device.getOperation(),
-                                                  "__air_external_buffer");
-          auto extBuf = AIE::ExternalBufferOp::create(
-              builder, builder.getUnknownLoc(), memrefTy,
-              builder.getStringAttr(sym_name), /*address=*/nullptr);
-          remap.map(operand, extBuf.getResult());
-        }
-        return WalkResult::advance();
-      });
-    }
-
-    SmallVector<func::FuncOp> funcs;
-    module.walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
-        [&](func::FuncOp f) {
-          funcs.push_back(f);
-          return WalkResult::advance();
-        });
-    for (auto f : funcs) {
-      f.walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
-          [&](Operation *op) {
-            if (isa<air::LaunchOp, func::FuncOp>(op))
-              return WalkResult::advance();
-            if (isa<air::SegmentOp>(op) && clone_l2)
-              return WalkResult::advance();
-            if (isa<air::HerdOp>(op))
-              return WalkResult::skip();
-            if (isa<air::LaunchTerminatorOp, air::SegmentTerminatorOp,
-                    func::ReturnOp, air::WaitAllOp>(op))
-              return WalkResult::advance();
-            bool hasParentSegmentOp = op->getParentOfType<air::SegmentOp>();
-            if (!clone_l3 && !hasParentSegmentOp)
-              return WalkResult::advance();
-            // Filter by target launch: if a targetLaunch is specified, only
-            // clone ops that belong to that launch
-            if (targetLaunch) {
-              auto parentLaunch = op->getParentOfType<air::LaunchOp>();
-              // If the op is not inside any launch or is inside a different
-              // launch, do not clone it.
-              if (!parentLaunch || parentLaunch != targetLaunch)
-                return WalkResult::advance();
-            }
-            builder.clone(*op, remap);
-            return WalkResult::skip();
-          });
-    }
-
-    // Remove ops which are irrelevant to L2 and L3 data movements.
-    aie_device.walk([ctx](air::HierarchyInterface hierOp) {
-      OpBuilder b(hierOp);
-      for (auto r : hierOp->getResults()) {
-        if (isa<air::AsyncTokenType>(r.getType())) {
-          r.replaceAllUsesWith(
-              air::WaitAllOp::create(b, hierOp->getLoc(),
-                                     air::AsyncTokenType::get(ctx),
-                                     air::getAsyncDependenciesFromOp(hierOp))
-                  .getAsyncToken());
-        }
-      }
-      hierOp->erase();
-    });
-
-    // Unroll scf.parallel
-    RewritePatternSet patterns(ctx);
-    air::populateAIRunrollAIRChannelPutGetInScfParallelPatterns(patterns);
-    (void)applyPatternsGreedily(aie_device, std::move(patterns));
-
-    // Substituting index operands, such as strides and offsets, to constant
-    // zero for convenience. TODO: generalize this
-    aie_device.walk([](air::ChannelInterface chanI) {
-      OpBuilder b(chanI);
-      for (auto oper : llvm::concat<Value>(chanI.getOffsets(), chanI.getSizes(),
-                                           chanI.getStrides())) {
-        if (!getConstantIntValue(oper)) {
-          chanI->replaceUsesOfWith(
-              oper, arith::ConstantIndexOp::create(b, b.getUnknownLoc(), 0));
-        }
-      }
-    });
-
-    // Generate dummy air.channel ops to balance the number of BDs at either
-    // side of an L2 buffer, to protect against risks of race conditions.
-    if (lock_race_condition_fix) {
-      insertDummyChannelOpsForL2Memrefs(aie_device, builder);
-    }
-  }
+  // Delegates to free function cloneL2AndL3MemcpysToDeviceOp.
 
   bool everyAIRChannelAccessIsContiguousRowMajor(
       std::vector<air::ChannelInterface> ops) {
@@ -5428,7 +5249,8 @@ public:
 
       // Create the AIE get_cascade op to fetch cascade data as a single vector.
       Value cascadeData =
-          AIE::GetCascadeOp::create(rewriter, loc, collapsedVecTy);
+          AIE::GetCascadeOp::create(rewriter, loc, collapsedVecTy,
+                                        /*conduit_channel=*/mlir::FlatSymbolRefAttr{});
 
       // Collapse the destination memref into a 1D memref to match the data
       // layout.
@@ -5464,7 +5286,8 @@ public:
           /*inBounds*/ SmallVector<bool>{true});
 
       // Send the vector data via AIE put_cascade.
-      AIE::PutCascadeOp::create(rewriter, loc, cascadeData);
+      AIE::PutCascadeOp::create(rewriter, loc, cascadeData,
+                                    /*conduit_channel=*/mlir::FlatSymbolRefAttr{});
     }
 
     // Remove the original air.channel.get op
@@ -6007,6 +5830,7 @@ public:
           /*.emit_herd_lock = */ clEmitHerdLock,
           /*.generate_shim_dma = */ clGenerateShimDMA,
           /*.insert_trace_packet_flow = */ clInsertTracePacketFlow,
+          /*.use_packet_flow_at_shim_dmas = */ false,
           /*.use_lock_race_condition_fix = */ clUseLockRaceConditionFix,
           /*.device = */ *device};
 
@@ -6119,6 +5943,7 @@ public:
         /* .emit_herd_lock = */ clEmitHerdLock,
         /* .generate_shim_dma = */ clGenerateShimDMA,
         /* .insert_trace_packet_flow = */ clInsertTracePacketFlow,
+        /* .use_packet_flow_at_shim_dmas = */ false,
         /* .use_lock_race_condition_fix = */ clUseLockRaceConditionFix,
         /* .device = */ *device};
     createAIEModulesAndOutlineCores(module, aie_devices, tileToHerdMap,
@@ -6635,6 +6460,7 @@ FailureOr<ModuleOp> convertAIRToAIE(mlir::RewriterBase &rewriter,
       /* .emit_herd_lock = */ false,
       /* .generate_shim_dma = */ false,
       /* .insert_trace_packet_flow = */ false,
+      /* .use_packet_flow_at_shim_dmas = */ false,
       /* .use_lock_race_condition_fix = */ true,
       /* .device = */ *device};
   std::vector<std::pair<ModuleOp, air::HerdOp>> aie_modules;

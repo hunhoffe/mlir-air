@@ -6245,7 +6245,7 @@ public:
     func.walk([&shimFors](scf::ForOp forOp) {
       // Get for loop band outside of any segment or herd region, and directly
       // nested in a launch or func op.
-      if (isa<air::LaunchOp, air::RankOp, func::FuncOp>(forOp->getParentOp())) {
+      if (isa<air::LaunchOp, func::FuncOp>(forOp->getParentOp())) {
         shimFors.push_back(forOp);
       }
     });

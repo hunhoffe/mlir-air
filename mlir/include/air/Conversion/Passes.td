@@ -163,6 +163,57 @@ def AIRLinalgToFunc : Pass<"air-linalg-to-func", "ModuleOp"> {
   ];
 }
 
+def AIRHierarchyToAIE : Pass<"air-hierarchy-to-aie", "ModuleOp"> {
+  let summary = "Lower AIR hierarchy (launch/segment/herd) to AIE tiles+cores, "
+                "preserving air.channel ops for subsequent Conduit lowering";
+  let constructor = "xilinx::air::createAIRHierarchyToAIEPass()";
+  let description = [{
+    Extracts the hierarchy-lowering portion of --air-to-aie and stops before
+    channel/DMA lowering.  After this pass the IR contains:
+
+      - aie.device, aie.tile, aie.core (hierarchy lowered)
+      - air.channel declarations still present inside aie.device
+      - air.channel.put/get/wait_all still present inside aie.core bodies
+      - No aie.objectfifo, no aie.lock, no aie.flow, no aie.dma_bd
+
+    This is the intended entry point for the Conduit pipeline on AIR programs:
+
+      air-opt --air-hierarchy-to-aie \
+              --air-channel-to-conduit \
+              --conduit-to-dma <file.mlir>
+
+    The pass runs steps 1-5 of the AIRToAIE pipeline:
+      1. renumberMemcpyIfOps (module-level)
+      2. createAIEModulesAndOutlineCores
+      3. cloneL2AndL3MemcpysToDeviceOp
+      4. specializeHerdAffineIf + lowerAirExecute + lowerScfAirTokens
+      5. specializeChannelBundle + removeOrphanedChannels
+  }];
+  let options = [
+    Option<"clRowOffset", "row-offset", "unsigned", /*default=*/"1",
+           "The default start row for any herds without 'y_loc' attribute.">,
+    Option<"clColOffset", "col-offset", "unsigned", /*default=*/"1",
+           "The default start column for any herds without 'x_loc' attribute.">,
+    Option<"clEmitWhileLoop", "emit-while-loop", "bool",
+           /*default=*/"false",
+           "Emit a while(1) around the herd code in generated AIR.core ops.">,
+    Option<"clEmitHerdLock", "emit-herd-lock", "bool",
+           /*default=*/"false",
+           "Acquire and release a lock at the start and end of herd execution.">,
+    Option<"clDevice", "device", "std::string",
+          /*default=*/"\"xcvc1902\"",
+           "AIE device to target.">,
+    Option<"clUseLockRaceConditionFix", "use-lock-race-condition-fix", "bool",
+          /*default=*/"false",
+          "Insert dummy channel ops to balance L2 buffer BDs "
+          "(race condition fix).">,
+  ];
+  let dependentDialects = [
+    "xilinx::AIE::AIEDialect",
+    "xilinx::AIEX::AIEXDialect",
+  ];
+}
+
 def AIRToAIE : Pass<"air-to-aie", "ModuleOp"> {
   let summary = "Lower air.launch_herd to AIE dialect";
   let constructor = "xilinx::air::createAIRToAIEPass()";
@@ -415,6 +466,52 @@ def AIRRtToNpu : Pass<"airrt-to-npu", "ModuleOp"> {
   let dependentDialects = ["xilinx::AIEX::AIEXDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// AirChannelToConduit — air-channel-to-conduit (Pass B)
+// Requires: AIR_ENABLE_AIE (depends on mlir-aie Conduit dialect)
+//===----------------------------------------------------------------------===//
+
+def AirChannelToConduit : Pass<"air-channel-to-conduit", "ModuleOp"> {
+  let summary = "Lift air.channel.put/get ops into Conduit IR (Pass B)";
+  let constructor = "xilinx::conduit::createAirChannelToConduitPass()";
+  let description = [{
+    Converts air.channel declarations and their put/get/wait_all ops into
+    Conduit IR Tier 3 memref-DMA ops (conduit.put_memref_async,
+    conduit.get_memref_async, conduit.wait_all_async).
+
+    This is Pass B of the Conduit lowering pipeline. The pass is implemented
+    in mlir-aie (AirChannelToConduit.cpp) and registered here so that
+    air-opt can invoke it with --air-channel-to-conduit.
+
+    Requires --allow-unregistered-dialect when the AIR dialect is not linked.
+
+    Pass option:
+      --air-channel-to-conduit-infer-rates=<bool>  (default: true)
+        Run --conduit-infer-rates inline at the end to attach
+        CSDF producer_rates/consumer_rates and enable M6/M7 verification.
+  }];
+  let options = [
+    Option<"inferRates", "infer-rates", "bool", /*default=*/"false",
+           "Run conduit-infer-rates inline at the end of the pass. "
+           "Default is false because air.channel slot_elems does not match "
+           "CSDF buffer-slot semantics; enabling triggers spurious M7.">,
+  ];
+  let dependentDialects = [
+    "xilinx::conduit::ConduitDialect",
+    "::mlir::memref::MemRefDialect",
+  ];
+}
+
+def AirChannelIndexFlattener : Pass<"air-channel-flatten-indices", "ModuleOp"> {
+  let summary = "Flatten multi-dimensional air.channel index ops to scalar channels";
+  let constructor = "xilinx::conduit::createAirChannelIndexFlattenerPass()";
+  let description = [{
+    Rewrites multi-dimensional air.channel declarations and their put/get ops
+    to use scalar channels, as a prerequisite for --air-channel-to-conduit
+    when multi-dimensional channels are present.
+  }];
+}
+
 def AIRSplitDevices : Pass<"air-split-devices", "ModuleOp"> {
   let summary = "Split the input into one output per aie.device op";
   let constructor = "xilinx::air::createAIRSplitDevicesPass()";
@@ -439,19 +536,6 @@ def InsertEmptyLaunchOverHerd : Pass<"air-insert-launch-around-herd", "ModuleOp"
           /*default=*/"false",
            "Option to insert an air.segment around the herd. ">,
   ];
-}
-
-def AIRRankToLaunch : Pass<"air-rank-to-launch", "ModuleOp"> {
-  let summary = "Serialize air.rank into scf.for loops";
-  let constructor = "xilinx::air::createAIRRankToLaunchPass()";
-  let description = [{
-    This pass lowers `air.rank` operations by serializing them into
-    `scf.for` loops. Each iteration of the loop corresponds to one
-    rank (device) executing the body sequentially. The rank index
-    is threaded into the enclosed operations as loop induction variables.
-
-    After this pass, no `air.rank` operations remain in the IR.
-  }];
 }
 
 def AIRWrapFuncWithParallelPass : Pass<"air-wrap-func-with-parallel", "func::FuncOp"> {
