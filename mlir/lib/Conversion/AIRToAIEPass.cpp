@@ -3283,6 +3283,246 @@ private:
   std::map<Operation *, AIE::ObjectFifoCreateOp> &linksToComplete;
 };
 
+// Lowers an air.channel straight to the pool and endpoint form that
+// `aie.objectfifo` itself splits into, rather than to `aie.objectfifo`. The
+// point of the level is that it says more than the objectfifo op can: each
+// end's DMA transform is its own attribute, the pool is a named resource
+// whose buffers and locks a later pass may also be handed by the design, and
+// the route carries the packet header that #aie.packet_info standardises.
+// Everything below (buffers, locks, channels, flows, BD chains, core lock
+// accesses) comes from mlir-aie's --aie-objectfifo-allocate, -lower-dmas and
+// -lower-cores, so nothing here emits a lock or a descriptor.
+//
+// Spike scope: one put, one get (an absent end is L3 on a shim), L1 memrefs,
+// static sizes and strides. Broadcast, L2 links and cascade are left to the
+// assessment.
+struct LowerAIRChannelsToPoolsPattern
+    : public OpRewritePattern<air::ChannelOp> {
+  LowerAIRChannelsToPoolsPattern(MLIRContext *ctx,
+                                 ShimTileAllocator &shimTileAlloc)
+      : OpRewritePattern(ctx), shimTileAlloc(shimTileAlloc) {}
+
+  LogicalResult matchAndRewrite(air::ChannelOp channel,
+                                PatternRewriter &rewriter) const override {
+    auto device = channel->getParentOfType<AIE::DeviceOp>();
+    if (!device)
+      return failure();
+    if (channel.getBundleSize() > 1)
+      return failure();
+    if (channel.getChannelType() == "npu_cascade" ||
+        channel.getChannelType() == "npu_mmio")
+      return channel.emitOpError("pool lowering covers dma channels only");
+
+    std::vector<air::ChannelPutOp> puts =
+        getChannelPutOpThroughSymbol(channel, device);
+    std::vector<air::ChannelGetOp> gets =
+        getChannelGetOpThroughSymbol(channel, device);
+    if (puts.size() > 1 || gets.size() > 1)
+      return channel.emitOpError(
+          "pool lowering covers one-to-one channels only");
+    if (puts.empty() && gets.empty())
+      return failure();
+
+    MLIRContext *ctx = rewriter.getContext();
+    Location loc = channel.getLoc();
+    std::string name = "air_" + channel.getName().str();
+    int depth = channel.getBufferResources();
+
+    // Insert the pools after the tiles, where the objectfifo path puts its op.
+    Block *body = device.getBody();
+    rewriter.setInsertionPointToStart(body);
+    for (auto &op : body->getOperations()) {
+      if (isa<AIE::TileOp, AIE::LogicalTileOp>(op))
+        rewriter.setInsertionPointAfter(&op);
+      else
+        break;
+    }
+
+    // Each L1 end becomes a pool on its core's tile with a core endpoint on
+    // one side and a DMA endpoint on the other; the transfer's sizes and
+    // strides ride on the DMA endpoint. An L3 end is a route endpoint on a
+    // shim, the runtime's to drive.
+    std::string prodEnd, consEnd;
+    MemRefType elemType;
+    if (!puts.empty()) {
+      air::ChannelPutOp put = puts[0];
+      if (failed(checkL1(put, put.getSrc())))
+        return failure();
+      elemType = poolElemType(put.getSrc());
+      Value tile = put->getParentOfType<AIE::CoreOp>().getTileOp();
+      createPool(rewriter, loc, name + "_prod_pool", tile, depth, elemType);
+      createCoreEndpoint(rewriter, loc, name + "_prod", tile,
+                         AIE::ObjectFifoRole::Fill, name + "_prod_pool");
+      createDmaEndpoint(rewriter, loc, name + "_prod_dma", tile,
+                        AIE::ObjectFifoRole::Drain, name + "_prod_pool",
+                        put.getMixedSrcSizes(), put.getMixedSrcStrides(), name);
+      prodEnd = name + "_prod_dma";
+    } else {
+      Value shim = shimTileAlloc.getShimTile(rewriter, device, name);
+      createShimEndpoint(rewriter, loc, name + "_shim_in", shim, name);
+      prodEnd = name + "_shim_in";
+    }
+    if (!gets.empty()) {
+      air::ChannelGetOp get = gets[0];
+      if (failed(checkL1(get, get.getDst())))
+        return failure();
+      MemRefType getType = poolElemType(get.getDst());
+      if (elemType && getType != elemType)
+        return channel.emitOpError("put and get types differ: ")
+               << elemType << " and " << getType;
+      elemType = getType;
+      Value tile = get->getParentOfType<AIE::CoreOp>().getTileOp();
+      createPool(rewriter, loc, name + "_cons_pool", tile, depth, elemType);
+      createDmaEndpoint(rewriter, loc, name + "_cons_dma", tile,
+                        AIE::ObjectFifoRole::Fill, name + "_cons_pool",
+                        get.getMixedDstSizes(), get.getMixedDstStrides(), name);
+      createCoreEndpoint(rewriter, loc, name + "_cons", tile,
+                         AIE::ObjectFifoRole::Drain, name + "_cons_pool");
+      consEnd = name + "_cons_dma";
+    } else {
+      Value shim = shimTileAlloc.getShimTile(rewriter, device, name);
+      createShimEndpoint(rewriter, loc, name + "_shim_out", shim, name);
+      consEnd = name + "_shim_out";
+    }
+
+    // The route carries the switching the channel asked for, in the one
+    // header spelling; --aie-assign-packet-ids fills in an open id.
+    AIE::PacketInfoAttr packet;
+    if (channel.getChannelType() == "npu_dma_packet") {
+      std::optional<uint16_t> id;
+      if (ArrayAttr ids = channel.getPacketIDs(); ids && ids.size() == 1)
+        id = cast<IntegerAttr>(ids[0]).getInt();
+      packet = AIE::PacketInfoAttr::get(ctx, /*pkt_type=*/0, id);
+    }
+    AIE::RouteOp::create(
+        rewriter, loc, FlatSymbolRefAttr::get(ctx, prodEnd),
+        rewriter.getArrayAttr({FlatSymbolRefAttr::get(ctx, consEnd)}), packet);
+
+    // A core works its pool through its endpoint: the alloc becomes an
+    // acquire of one object, the dealloc a release.
+    for (air::ChannelPutOp put : puts)
+      rewriteCoreAccess(rewriter, put, put.getSrc(), name + "_prod", elemType);
+    for (air::ChannelGetOp get : gets)
+      rewriteCoreAccess(rewriter, get, get.getDst(), name + "_cons", elemType);
+    for (air::ChannelGetOp get : gets)
+      rewriter.eraseOp(get);
+    for (air::ChannelPutOp put : puts)
+      rewriter.eraseOp(put);
+    rewriter.eraseOp(channel);
+    return success();
+  }
+
+private:
+  static LogicalResult checkL1(Operation *op, Value memref) {
+    auto type = cast<MemRefType>(memref.getType());
+    if (air::getMemorySpace(type) != air::MemorySpace::L1)
+      return op->emitOpError("pool lowering covers L1 ends only");
+    if (!op->getParentOfType<AIE::CoreOp>())
+      return op->emitOpError("is not inside an aie.core");
+    return success();
+  }
+
+  static MemRefType poolElemType(Value memref) {
+    auto type = cast<MemRefType>(memref.getType());
+    return MemRefType::get(type.getShape(), type.getElementType());
+  }
+
+  static void createPool(PatternRewriter &rewriter, Location loc,
+                         StringRef name, Value tile, int depth,
+                         MemRefType elemType) {
+    auto pool = AIE::ObjectFifoPoolOp::create(
+        rewriter, loc, rewriter.getStringAttr(name), tile,
+        rewriter.getI32IntegerAttr(depth), TypeAttr::get(elemType),
+        /*buffers=*/ArrayAttr(), /*locks=*/ArrayAttr(),
+        /*repeatCount=*/IntegerAttr(),
+        /*disableSynchronization=*/rewriter.getBoolAttr(false),
+        /*fifoName=*/StringAttr(), /*initValues=*/ArrayAttr());
+    Block &segments = pool.getSegments().emplaceBlock();
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&segments);
+    AIE::ObjectFifoSegmentOp::create(
+        rewriter, loc, rewriter.getStringAttr("s0"),
+        rewriter.getI32IntegerAttr(0),
+        rewriter.getI32IntegerAttr(elemType.getNumElements()),
+        /*produceLock=*/FlatSymbolRefAttr(),
+        /*consumeLock=*/FlatSymbolRefAttr());
+  }
+
+  static void createCoreEndpoint(PatternRewriter &rewriter, Location loc,
+                                 StringRef name, Value tile,
+                                 AIE::ObjectFifoRole role, StringRef pool) {
+    AIE::ObjectFifoCoreEndpointOp::create(
+        rewriter, loc, rewriter.getStringAttr(name), tile,
+        AIE::ObjectFifoRoleAttr::get(rewriter.getContext(), role),
+        FlatSymbolRefAttr::get(rewriter.getContext(), pool),
+        /*segments=*/ArrayAttr());
+  }
+
+  // A transfer that walks the whole object once needs no transform; anything
+  // else is the endpoint's dimensions, the same attribute an objectfifo's
+  // dimensionsToStream becomes.
+  static void createDmaEndpoint(PatternRewriter &rewriter, Location loc,
+                                StringRef name, Value tile,
+                                AIE::ObjectFifoRole role, StringRef pool,
+                                ArrayRef<OpFoldResult> sizes,
+                                ArrayRef<OpFoldResult> strides,
+                                StringRef fifoName) {
+    MLIRContext *ctx = rewriter.getContext();
+    AIE::BDDimLayoutArrayArrayAttr dimensions;
+    std::vector<AIE::BDDimLayoutAttr> dims =
+        air::getWrapsAndStrides(sizes, strides, ctx);
+    bool contiguous = dims.size() <= 1;
+    if (!contiguous) {
+      dimensions = AIE::BDDimLayoutArrayArrayAttr::get(
+          ctx, {AIE::BDDimLayoutArrayAttr::get(ctx, dims)});
+    }
+    AIE::ObjectFifoDmaEndpointOp::create(
+        rewriter, loc, rewriter.getStringAttr(name), tile,
+        AIE::ObjectFifoRoleAttr::get(ctx, role),
+        FlatSymbolRefAttr::get(ctx, pool), /*segments=*/ArrayAttr(),
+        /*channelIndex=*/IntegerAttr(), dimensions,
+        /*padDimensions=*/AIE::BDPadLayoutArrayArrayAttr(),
+        /*padValue=*/IntegerAttr(), /*iterCount=*/IntegerAttr(),
+        /*packet=*/AIE::PacketInfoAttr(), rewriter.getStringAttr(fifoName));
+  }
+
+  static void createShimEndpoint(PatternRewriter &rewriter, Location loc,
+                                 StringRef name, Value shim,
+                                 StringRef fifoName) {
+    AIE::RouteEndpointOp::create(
+        rewriter, loc, rewriter.getStringAttr(name), shim,
+        AIE::WireBundleAttr::get(rewriter.getContext(), AIE::WireBundle::DMA),
+        /*channelIndex=*/IntegerAttr(), /*packet=*/AIE::PacketInfoAttr(),
+        rewriter.getStringAttr(fifoName));
+  }
+
+  template <typename ChannelAccess>
+  static void rewriteCoreAccess(PatternRewriter &rewriter, ChannelAccess op,
+                                Value memref, StringRef endpoint,
+                                MemRefType elemType) {
+    auto alloc = dyn_cast_if_present<memref::AllocOp>(memref.getDefiningOp());
+    if (!alloc)
+      return;
+    rewriter.setInsertionPoint(&op->getBlock()->front());
+    auto acquire = AIE::ObjectFifoAcquireOp::create(
+        rewriter, op.getLoc(), TypeRange{elemType},
+        /*port=*/AIE::ObjectFifoPortAttr(),
+        FlatSymbolRefAttr::get(rewriter.getContext(), endpoint));
+    for (Operation *user : llvm::make_early_inc_range(alloc->getUsers())) {
+      if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
+        rewriter.setInsertionPoint(dealloc);
+        AIE::ObjectFifoReleaseOp::create(
+            rewriter, dealloc.getLoc(), AIE::ObjectFifoPortAttr(), endpoint, 1);
+        rewriter.eraseOp(dealloc);
+      }
+    }
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
+        alloc, alloc.getType(), acquire.getObjects().front());
+  }
+
+  ShimTileAllocator &shimTileAlloc;
+};
+
 // This function replaces ChannelPutOp/ChannelGetOp with AIE_CreateObjectFifoOps
 // and with ObjectFifoAcquireOp<Producer/Consumer>. It also erases memref allocs
 // as the objFifo lowering allocates its own memory. It replaces the associated
@@ -8033,12 +8273,18 @@ public:
 
     ShimTileAllocator shimTileAlloc(AIE::getTargetModel(*device));
     std::map<Operation *, AIE::ObjectFifoCreateOp> linksToComplete;
-    if (clTestPatterns.find("lower-air-channels") != std::string::npos) {
+    if (clTestPatterns.find("lower-air-channels") != std::string::npos &&
+        clTestPatterns.find("lower-air-channels-to-pools") ==
+            std::string::npos) {
       patterns.insert<LowerAIRChannelsPattern>(
           ctx, shimTileAlloc, bufferToMemtileMap, linksToComplete);
     }
     if (clTestPatterns.find("lower-air-ping-pong") != std::string::npos) {
       patterns.insert<LowerAIRPingPongPattern>(ctx);
+    }
+    if (clTestPatterns.find("lower-air-channels-to-pools") !=
+        std::string::npos) {
+      patterns.insert<LowerAIRChannelsToPoolsPattern>(ctx, shimTileAlloc);
     }
     std::map<std::string, std::string> chan_to_chan_map;
     if (clTestPatterns.find("specialize-channel-bundle") != std::string::npos) {
