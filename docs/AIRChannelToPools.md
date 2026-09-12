@@ -112,7 +112,10 @@ the direct path stays for the rest.
   mlir-aie stops printing `pkt_type = 0` (its #34), seven AIRToAIE tests
   need the same one-token edit on their CHECK lines. Nothing else in the
   suite moves.
-- The existing `use-objectfifo` flag on `--air-to-aie` is not the objectfifo
-  path's entry point; the path runs only through `test-patterns`, and no test
-  in the tree uses the flag. The flag's branches in `runOnOperation` predate
-  the current objectfifo pipeline and have no coverage.
+- The `use-objectfifo` flag on `--air-to-aie` is the objectfifo path's
+  production entry point, and it is covered: three tests turn it on
+  (`async_gemm_to_objectfifo`, `air_channel_to_objectfifo_L1toL2`,
+  `air_channel_to_objectfifo_L2_broadcast`) and twelve pass it off
+  explicitly. The `lower-air-channels` test pattern exercises the same
+  pattern in isolation. A pools path would sit beside it as a third
+  backend, or replace it once it covers what those three tests cover.
