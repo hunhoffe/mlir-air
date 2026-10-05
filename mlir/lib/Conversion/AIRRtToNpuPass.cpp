@@ -1427,7 +1427,7 @@ struct HerdLoadToNpuPattern : public OpConversionPattern<airrt::HerdLoadOp> {
 
         auto setLockOp =
             AIEX::SetLockOp::create(rewriter, op.getLoc(), lockOp.getResult(),
-                                    rewriter.getI32IntegerAttr(1));
+                                    arith::ConstantOp::create(rewriter, op.getLoc(), rewriter.getI32IntegerAttr(1)));
         if (waveAttr)
           setLockOp->setAttr(air::attrs::LaunchWave, waveAttr);
       }
